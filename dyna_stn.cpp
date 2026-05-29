@@ -1,9 +1,9 @@
 /**
  * Dyna-STN: Dynamic Discrete Topology-Oriented Wide-Area Routing
- * Li, Wu, Wang — IEEE/ACM Transactions on Networking, Vol.32, No.5, 2024
+ * Li, Wu, Wang - IEEE/ACM Transactions on Networking, Vol.32, No.5, 2024
  *
  * Complete implementation with all improvements:
- *   1.  Algorithm 1 (SID/VID Binding Procedure) — full 10-step state machine,
+ *   1.  Algorithm 1 (SID/VID Binding Procedure) - full 10-step state machine,
  *       Boolean(LocSID,C), Inquire(SID,LocSID,t), all message types
  *   2.  RouterState: RIB, FIB, RouterConfig, status RUNNING/SUSPENDED/MIGRATING
  *   3.  Service migration: tcp/tdp/tl/Tm (data/control-plane split, Section III-A-3)
@@ -32,7 +32,7 @@
 #include <functional>
 
 // ================================================================
-//  §0  CONSTANTS  (Table IV and simulation parameters)
+//  Sector0  CONSTANTS  (Table IV and simulation parameters)
 // ================================================================
 namespace C {
     constexpr double PI      = 3.141592653589793;
@@ -45,40 +45,40 @@ namespace C {
     constexpr int    T_orb   = 6900;                // s   orbital period
     constexpr double polar_B = 70.0 * PI / 180.0;   // rad  polar blackout boundary
 
-    // ── ISL quality (eqs.14-22, calibrated for Iridium distances) ──
+    // -- ISL quality (eqs.14-22, calibrated for Iridium distances) --
     // U_SNR(L) = 1 – exp( –Pt_eff · (Lv/L)² )
-    // At L = Lv ≈ 4054 km  →  U_SNR ≈ 0.950  (Pt_eff = 3.0)
-    // At L = Lh ≈ 2035 km  →  U_SNR ≈ 0.9999
+    // At L = Lv approx 4054 km  ->  U_SNR approx 0.950  (Pt_eff = 3.0)
+    // At L = Lh approx 2035 km  ->  U_SNR approx 0.9999
     constexpr double Pt_eff  = 3.0;   // calibrated SNR coefficient
     constexpr double ws      = 0.6;   // SNR utility weight       (eq.28)
     constexpr double wl      = 0.4;   // duration utility weight  (eq.28)
 
-    // ── Coverage ──────────────────────────────────────────────────
+    // -- Coverage --------------------------------------------------
     constexpr double theta_min = 10.0 * PI / 180.0;  // rad  min elevation (eqs.8-11)
 
-    // ── Service-migration timing (calibrated: Tm_66nodes ≈ 0.13 s) ──
+    // -- Service-migration timing (calibrated: Tm_66nodes approx 0.13 s) --
     // Step 2-3: control-plane migration
     constexpr double tcp_base      = 0.050;   // s  base cost (tunnel + image copy)
     constexpr double tcp_per_route = 0.0005;  // s  per RIB entry
-    // Step 4: data-plane clone (FIB installation 100-500 µs per entry)
+    // Step 4: data-plane clone (FIB installation 100-500 micros per entry)
     constexpr double tdp_per_fib   = 0.00030; // s  per FIB entry
     // Step 5: asynchronous link migration
     constexpr double tl_per_link   = 0.010;   // s  per ISL
 
-    // ── OSPF parameters ───────────────────────────────────────────
+    // -- OSPF parameters -------------------------------------------
     constexpr int    hello_ivl  = 10;        // s
     constexpr int    dead_ivl   = 40;        // s
     constexpr double c_light    = 3.0e5;     // km/s (propagation speed)
-    // Dijkstra calibration: 66 nodes → ~0.35 ms total for all RIBs
+    // Dijkstra calibration: 66 nodes -> ~0.35 ms total for all RIBs
     constexpr double dijk_coeff = 1.5e-6;    // s per (V*(E+V)*logV) op
 
-    // ── Traffic ───────────────────────────────────────────────────
+    // -- Traffic ---------------------------------------------------
     constexpr double bw_link   = 100.0;   // Mbps per ISL
     constexpr double queue_ms  = 0.5;     // ms queuing delay per hop
 }
 
 // ================================================================
-//  §1  GEOMETRY
+//  Sector1  GEOMETRY
 // ================================================================
 
 struct Vec3 {
@@ -105,7 +105,7 @@ struct Vec3 {
     }
 };
 
-// Geographic (lat°, lon°) → ECEF km
+// Geographic (latdeg, londeg) -> ECEF km
 Vec3 llToECEF(double lat_deg, double lon_deg, double r = C::Re) {
     double la = lat_deg * C::PI / 180.0;
     double lo = lon_deg * C::PI / 180.0;
@@ -114,7 +114,7 @@ Vec3 llToECEF(double lat_deg, double lon_deg, double r = C::Re) {
              r * std::sin(la) };
 }
 
-// ── ISL lengths (eqs.1-2) ──────────────────────────────────────
+// -- ISL lengths (eqs.1-2) --------------------------------------
 
 // Intra-plane ISL length (eq.1)
 double Lv_km() {
@@ -139,39 +139,39 @@ double maxCommTime_s() {
 }
 
 // ================================================================
-//  §2  ISL QUALITY MODEL  (eqs.14-28, calibrated)
+//  Sector2  ISL QUALITY MODEL  (eqs.14-28, calibrated)
 // ================================================================
 
 namespace ISL {
 
 static double Lv_ref = 0.0;   // set once in main
 
-// ── U_SNR (eqs.14-22, calibrated) ────────────────────────────
-// Replaces the raw Gaussian-beam formula that yields U≈0 at Iridium
+// -- U_SNR (eqs.14-22, calibrated) ----------------------------
+// Replaces the raw Gaussian-beam formula that yields Uapprox0 at Iridium
 // distances due to missing unit normalisation in the paper.
 // We keep the functional form SNR ∝ L^-2, calibrated so that:
-//   U_SNR(Lv) ≈ 0.95  (intra-plane ISL at reference distance)
+//   U_SNR(Lv) approx 0.95  (intra-plane ISL at reference distance)
 double uSNR(double Lij) {
     if (Lij <= 0.0 || Lv_ref <= 0.0) return 0.0;
     double snr = C::Pt_eff * (Lv_ref / Lij) * (Lv_ref / Lij);  // eq.17 spirit
     return 1.0 - std::exp(-snr);                                  // eq.22
 }
 
-// ── U_dur (eqs.23-27) ─────────────────────────────────────────
+// -- U_dur (eqs.23-27) -----------------------------------------
 // Intra-plane ISLs are always active (paper Section IV-B).
-// Inter-plane ISLs are disrupted inside polar region (|lat| ≥ 70°).
+// Inter-plane ISLs are disrupted inside polar region (|lat| >= 70deg).
 double uDur(bool intraPlane, const Vec3& posA, const Vec3& posB) {
     if (intraPlane) return 1.0;              // intra-plane: always connected
     double latA = posA.lat_rad();
     double latB = posB.lat_rad();
     if (std::abs(latA) >= C::polar_B || std::abs(latB) >= C::polar_B)
-        return 0.0;                          // polar blackout → ISL down
+        return 0.0;                          // polar blackout -> ISL down
     // Linear decay as satellites approach the polar boundary
     double maxLat = std::max(std::abs(latA), std::abs(latB));
     return (C::polar_B - maxLat) / C::polar_B;   // eq.27 spirit
 }
 
-// ── U_total (eq.28) ───────────────────────────────────────────
+// -- U_total (eq.28) -------------------------------------------
 double uTotal(double Lij, bool intraPlane,
               const Vec3& posA, const Vec3& posB) {
     double us = uSNR(Lij);
@@ -183,13 +183,13 @@ double uTotal(double Lij, bool intraPlane,
 } // namespace ISL
 
 // ================================================================
-//  §3  DATA STRUCTURES
+//  Sector3  DATA STRUCTURES
 // ================================================================
 
 using SID = std::string;
 using VID = std::string;
 
-// ── Router status ─────────────────────────────────────────────
+// -- Router status ---------------------------------------------
 enum class RouterStatus { RUNNING, SUSPENDED, MIGRATING };
 
 inline std::string rsStr(RouterStatus s) {
@@ -201,7 +201,7 @@ inline std::string rsStr(RouterStatus s) {
     return "?";
 }
 
-// ── RouterConfig ──────────────────────────────────────────────
+// -- RouterConfig ----------------------------------------------
 struct RouterConfig {
     int    helloIvl = C::hello_ivl;   // s
     int    deadIvl  = C::dead_ivl;    // s
@@ -210,11 +210,11 @@ struct RouterConfig {
     int    lsaSeq   = 0;              // LSA sequence number base
 };
 
-// ── RIB / FIB entries ─────────────────────────────────────────
+// -- RIB / FIB entries -----------------------------------------
 struct RIBEntry { VID nextHop; double metric; };
 struct FIBEntry { VID outIface; double cost;  };
 
-// ── RouterState (per virtual router / virtual node) ────────────
+// -- RouterState (per virtual router / virtual node) ------------
 struct RouterState {
     RouterStatus              status     = RouterStatus::RUNNING;
     std::map<VID, RIBEntry>  rib;        // Routing Information Base
@@ -246,7 +246,7 @@ struct RouterState {
     }
 };
 
-// ── Satellite (Keplerian propagation) ─────────────────────────
+// -- Satellite (Keplerian propagation) -------------------------
 struct Satellite {
     SID    sid;
     int    plane, idx;
@@ -271,13 +271,13 @@ struct Satellite {
     bool inPolar() const { return std::abs(pos.lat_rad()) >= C::polar_B; }
 };
 
-// ── Virtual link (labelled intra/inter plane) ──────────────────
+// -- Virtual link (labelled intra/inter plane) ------------------
 struct VLink {
     VID  u, v;
     bool intra;   // true = intra-plane, false = inter-plane
 };
 
-// ── Virtual node (fixed service cube) ─────────────────────────
+// -- Virtual node (fixed service cube) -------------------------
 struct VirtualNode {
     VID         vid;
     int         plane, idx;
@@ -288,7 +288,7 @@ struct VirtualNode {
     RouterState router;
 };
 
-// ── Ground station ─────────────────────────────────────────────
+// -- Ground station ---------------------------------------------
 struct GS {
     std::string id;
     Vec3        pos;
@@ -297,7 +297,7 @@ struct GS {
 };
 
 // ================================================================
-//  §4  DIJKSTRA + LSDB  (Section III-B: Routing Calculation)
+//  Sector4  DIJKSTRA + LSDB  (Section III-B: Routing Calculation)
 // ================================================================
 
 struct LSAEntry {
@@ -375,7 +375,7 @@ std::vector<VID> getPath(
 }
 
 // ================================================================
-//  §5  OSPF SIMULATOR  (Section III-B)
+//  Sector5  OSPF SIMULATOR  (Section III-B)
 // ================================================================
 
 struct OSPFStats {
@@ -404,7 +404,7 @@ public:
         LSDB newLSDB;
         int V = 0;
 
-        // ── 1. Build fresh LSA for each active virtual node ──────
+        // -- 1. Build fresh LSA for each active virtual node ------
         for (const auto& vn : vns) {
             if (!vn.active) continue;
             V++;
@@ -433,33 +433,33 @@ public:
 
                 double L = sA->pos.dist(sB->pos);
                 double U = ISL::uTotal(L, intra, sA->pos, sB->pos);
-                if (U <= 0.0) continue;   // ISL down → exclude from LSDB
+                if (U <= 0.0) continue;   // ISL down -> exclude from LSDB
 
                 entry.links.push_back({nb, 1.0 / U});
             }
             newLSDB[vn.vid] = entry;
         }
 
-        // ── 2. Detect topology changes vs previous slot ───────────
+        // -- 2. Detect topology changes vs previous slot -----------
         for (auto& [vid, newE] : newLSDB) {
             auto it = lsdb.find(vid);
             if (it == lsdb.end() || !it->second.sameLinks(newE))
                 st.changedLinks++;
         }
 
-        // ── 3. Hello packets (Section III-B, Topology Establishment)
-        // Each active node sends Hello to ≤4 neighbours per slot
+        // -- 3. Hello packets (Section III-B, Topology Establishment)
+        // Each active node sends Hello to <=4 neighbours per slot
         st.helloPkts = V * 4;
 
-        // ── 4. LSA flooding (Section III-B)
+        // -- 4. LSA flooding (Section III-B)
         // Each changed LSA is flooded to all V nodes (OSPF flooding mechanism).
         // Dyna-STN: once the virtual overlay is established,
-        // topology changes = 0 → near-zero ongoing LSA overhead.
+        // topology changes = 0 -> near-zero ongoing LSA overhead.
         st.lsaPkts  = st.changedLinks * V;
         totalLSA   += st.lsaPkts;
 
-        // ── 5. Convergence time estimate ──────────────────────────
-        // diameter of Iridium grid+ ≈ M + N/2
+        // -- 5. Convergence time estimate --------------------------
+        // diameter of Iridium grid+ approx M + N/2
         int  E          = 0;
         for (auto& [vid, e] : newLSDB) E += (int)e.links.size();
         E /= 2;   // undirected
@@ -472,7 +472,7 @@ public:
         st.routeCalc_ms = calcMs;
         st.converge_ms  = floodMs + calcMs;
 
-        // ── 6. Update global LSDB and compute per-node RIBs ───────
+        // -- 6. Update global LSDB and compute per-node RIBs -------
         lsdb = newLSDB;
         ribs.clear();
         for (const auto& vn : vns)
@@ -508,7 +508,7 @@ private:
 };
 
 // ================================================================
-//  §6  SERVICE MIGRATION  (Section III-A-3, Fig.7)
+//  Sector6  SERVICE MIGRATION  (Section III-A-3, Fig.7)
 // ================================================================
 
 struct MigRes {
@@ -549,12 +549,12 @@ MigRes performMigration(const SID& from, const SID& to, const VID& vid,
 }
 
 // ================================================================
-//  §7  SID/VID MAPPING SERVER  (Table III)
+//  Sector7  SID/VID MAPPING SERVER  (Table III)
 // ================================================================
 
 class MapServer {
 public:
-    std::map<int, std::map<SID,VID>> table;   // slot → {SID→VID}
+    std::map<int, std::map<SID,VID>> table;   // slot -> {SID->VID}
     std::map<VID, bool>              actv;    // VID activation status
 
     void store(int slot, const SID& sid, const VID& vid) {
@@ -583,8 +583,8 @@ public:
     }
 
     void print(int maxSlots = 2) const {
-        std::cout << "\n══ SID/VID Mapping Table (Table III, last "
-                  << maxSlots << " slots) ══\n";
+        std::cout << "\n== SID/VID Mapping Table (Table III, last "
+                  << maxSlots << " slots) ==\n";
         std::cout << std::left << std::setw(6)  << "Slot"
                               << std::setw(16) << "SID"
                               << "VID\n"
@@ -601,20 +601,20 @@ public:
 };
 
 // ================================================================
-//  §8  ALGORITHM 1 — SID/VID BINDING PROCEDURE (full state machine)
+//  Sector8  ALGORITHM 1 - SID/VID BINDING PROCEDURE (full state machine)
 //      Implements: eqs.12-13, Fig.5 (dynamic binding mechanism),
 //                  Fig.6 (signalling process), Algorithm 1 pseudocode
 // ================================================================
 
 // Message types (from Figs.5-6 of the paper)
 enum class MsgType {
-    Inquire_FromSID,            // satellite → mapping server
-    Response_FromMapSrv,        // mapping server → new satellite
-    Shift_FromMapSrv,           // mapping server → old satellite
-    Request_FromSID,            // old satellite → new satellite
-    Confirm_FromSID,            // new satellite → old satellite
-    Migrate_FromSID,            // old satellite → new satellite (carries RIB+config)
-    Complete_FromSID            // new satellite → old satellite
+    Inquire_FromSID,            // satellite -> mapping server
+    Response_FromMapSrv,        // mapping server -> new satellite
+    Shift_FromMapSrv,           // mapping server -> old satellite
+    Request_FromSID,            // old satellite -> new satellite
+    Confirm_FromSID,            // new satellite -> old satellite
+    Migrate_FromSID,            // old satellite -> new satellite (carries RIB+config)
+    Complete_FromSID            // new satellite -> old satellite
 };
 
 inline std::string msgStr(MsgType t) {
@@ -645,20 +645,20 @@ struct Agent {
     RouterState router;
 };
 
-// ── DDTM Plane (manages all SID/VID bindings and migrations) ────
+// -- DDTM Plane (manages all SID/VID bindings and migrations) ----
 class DDTMPlane {
 public:
     MapServer              mapSrv;
     std::map<SID, Agent>   agents;             // per-satellite state
     std::map<VID, RouterState> vidRS;          // authoritative router state per VID
-    std::map<VID, SID>     vidCurSID;          // VID → bound SID
+    std::map<VID, SID>     vidCurSID;          // VID -> bound SID
     std::vector<MigRes>    migrations;         // migrations this slot
     std::vector<std::string> msgLog;           // Algorithm 1 trace
 
     int fn_sum = 0;   // eq.5 node-binding count
     int fl_sum = 0;   // eq.5 link-binding count
 
-    // ── Run Algorithm 1 for every satellite, process migrations ──
+    // -- Run Algorithm 1 for every satellite, process migrations --
     int runSlot(int slot, double now,
                 std::vector<VirtualNode>& vns,
                 const std::vector<Satellite>& sats,
@@ -669,14 +669,14 @@ public:
         migrations.clear();
         msgLog.clear();
 
-        // ── Phase 1: determine best satellite for each VN ────────
+        // -- Phase 1: determine best satellite for each VN --------
         // Implements eq.12  Boolean(LocSID, C)
         // For each satellite, check if it has entered a *new* service cube
         struct BestBind { VID vid; SID sid; double dist; };
-        std::map<VID, BestBind> vnToBest;   // VID → closest in-cube satellite
+        std::map<VID, BestBind> vnToBest;   // VID -> closest in-cube satellite
 
         for (const auto& sat : sats) {
-            // eq.12: Boolean(LocSID, C) — is satellite inside any service cube?
+            // eq.12: Boolean(LocSID, C) - is satellite inside any service cube?
             VID inCubeVID = mapSrv.inquire(sat.pos, vns, cubeR);
             if (inCubeVID.empty()) continue;
 
@@ -689,10 +689,10 @@ public:
                 vnToBest[inCubeVID] = {inCubeVID, sat.sid, d};
         }
 
-        // ── Phase 2: Message queue (index-based, allows push_back) ─
+        // -- Phase 2: Message queue (index-based, allows push_back) -
         std::vector<Msg> Q;
 
-        // Algorithm 1, line 2: if Boolean → send Inquire_FromSID_n
+        // Algorithm 1, line 2: if Boolean -> send Inquire_FromSID_n
         for (auto& [vid, bb] : vnToBest) {
             auto& ag = agents[bb.sid];
             ag.sid = bb.sid;
@@ -701,18 +701,18 @@ public:
                 // Satellite entering a new service cube
                 Q.push_back({MsgType::Inquire_FromSID,
                              bb.sid, "MapSrv", vid, {}});
-                msgLog.push_back("Inquire: " + bb.sid + " → MapSrv (VID=" + vid + ")");
+                msgLog.push_back("Inquire: " + bb.sid + " -> MapSrv (VID=" + vid + ")");
             }
         }
 
-        // ── Phase 3: Process message queue ───────────────────────
+        // -- Phase 3: Process message queue -----------------------
         for (size_t i = 0; i < Q.size(); i++) {
             // NOTE: Q may grow inside this loop; use index, not iterator
             const Msg msg = Q[i];   // copy to avoid dangling ref after push_back
 
             switch (msg.type) {
 
-            // ── Step 2: Mapping server → Response + optional Shift ──
+            // -- Step 2: Mapping server -> Response + optional Shift --
             case MsgType::Inquire_FromSID: {
                 const SID& newSID = msg.from;
                 const VID& vid    = msg.vid;
@@ -720,7 +720,7 @@ public:
                 // Algorithm 1 lines 4-6: Response_FromMappingServer
                 Q.push_back({MsgType::Response_FromMapSrv,
                              "MapSrv", newSID, vid, {}});
-                msgLog.push_back("Response: MapSrv → " + newSID);
+                msgLog.push_back("Response: MapSrv -> " + newSID);
 
                 // Algorithm 1 lines 7-8: Shift to old satellite if VID occupied
                 auto it = vidCurSID.find(vid);
@@ -729,13 +729,13 @@ public:
                 {
                     Q.push_back({MsgType::Shift_FromMapSrv,
                                  "MapSrv", it->second, vid, {}});
-                    msgLog.push_back("Shift: MapSrv → " + it->second
+                    msgLog.push_back("Shift: MapSrv -> " + it->second
                                      + " (VID=" + vid + ")");
                 }
                 break;
             }
 
-            // ── Step 3: New satellite binds VID (lines 4-6) ────────
+            // -- Step 3: New satellite binds VID (lines 4-6) --------
             case MsgType::Response_FromMapSrv: {
                 const SID& newSID = msg.to;
                 const VID& vid    = msg.vid;
@@ -745,7 +745,7 @@ public:
                 break;
             }
 
-            // ── Steps 4-5: Old satellite gets Shift → sends Request ─
+            // -- Steps 4-5: Old satellite gets Shift -> sends Request -
             // Algorithm 1 lines 7-8
             case MsgType::Shift_FromMapSrv: {
                 const SID& oldSID = msg.to;
@@ -762,11 +762,11 @@ public:
                                                          : agents[oldSID].router;
                 Q.push_back({MsgType::Request_FromSID,
                              oldSID, newSID, vid, rsToSend});
-                msgLog.push_back("Request: " + oldSID + " → " + newSID);
+                msgLog.push_back("Request: " + oldSID + " -> " + newSID);
                 break;
             }
 
-            // ── Step 6: New satellite suspends + sends Confirm ──────
+            // -- Step 6: New satellite suspends + sends Confirm ------
             // Algorithm 1 lines 9-11
             case MsgType::Request_FromSID: {
                 const SID& oldSID = msg.from;
@@ -777,12 +777,12 @@ public:
                 // Send Confirm to old satellite
                 Q.push_back({MsgType::Confirm_FromSID,
                              newSID, oldSID, vid, {}});
-                msgLog.push_back("Confirm: " + newSID + " → " + oldSID
+                msgLog.push_back("Confirm: " + newSID + " -> " + oldSID
                                  + " (suspended)");
                 break;
             }
 
-            // ── Step 7: Old satellite migrates RIB+config ───────────
+            // -- Step 7: Old satellite migrates RIB+config -----------
             // Algorithm 1 lines 12-13
             case MsgType::Confirm_FromSID: {
                 const SID& newSID = msg.from;   // sent the Confirm
@@ -798,12 +798,12 @@ public:
                 // Old satellite sends Migrate (carries RIB + config)
                 Q.push_back({MsgType::Migrate_FromSID,
                              oldSID, newSID, vid, rs});
-                msgLog.push_back("Migrate: " + oldSID + " → " + newSID
+                msgLog.push_back("Migrate: " + oldSID + " -> " + newSID
                                  + " Tm=" + std::to_string(mr.Tm).substr(0,5) + "s");
                 break;
             }
 
-            // ── Steps 8-9: New satellite updates RIB, restarts, sends Complete
+            // -- Steps 8-9: New satellite updates RIB, restarts, sends Complete
             // Algorithm 1 lines 14-17
             case MsgType::Migrate_FromSID: {
                 const SID& oldSID = msg.from;
@@ -819,15 +819,15 @@ public:
                 // Send Complete to old satellite
                 Q.push_back({MsgType::Complete_FromSID,
                              newSID, oldSID, vid, {}});
-                msgLog.push_back("Complete: " + newSID + " → " + oldSID);
+                msgLog.push_back("Complete: " + newSID + " -> " + oldSID);
                 break;
             }
 
-            // ── Step 10: Old satellite receives Complete ─────────────
+            // -- Step 10: Old satellite receives Complete -------------
             // Algorithm 1 pseudocode step 10: old satellite acknowledges.
-            // We must NOT clear curVID unconditionally — the old satellite
+            // We must NOT clear curVID unconditionally - the old satellite
             // may have already been re-bound to a NEW service cube within
-            // this same slot (Inquire→Response processed earlier in the
+            // this same slot (Inquire->Response processed earlier in the
             // message queue). Only clear if curVID still points to the VID
             // being migrated away from.
             case MsgType::Complete_FromSID: {
@@ -841,7 +841,7 @@ public:
             } // end switch
         } // end message queue processing
 
-        // ── Phase 4: Commit bindings to virtual nodes ─────────────
+        // -- Phase 4: Commit bindings to virtual nodes -------------
         for (auto& vn : vns) {
             vn.prevBound = vn.bound;
             vn.active    = false;
@@ -859,12 +859,12 @@ public:
             }
         }
 
-        // ── Phase 5: Update vidCurSID map ─────────────────────────
+        // -- Phase 5: Update vidCurSID map -------------------------
         vidCurSID.clear();
         for (auto& vn : vns)
             if (vn.active) vidCurSID[vn.vid] = vn.bound;
 
-        // ── Phase 6: Compute Q(t) = fn + fl  (eq.5) ──────────────
+        // -- Phase 6: Compute Q(t) = fn + fl  (eq.5) --------------
 
         // fn(i,j): one per active node binding
         for (auto& vn : vns)
@@ -922,7 +922,7 @@ private:
 };
 
 // ================================================================
-//  §9  TRAFFIC SIMULATION
+//  Sector9  TRAFFIC SIMULATION
 // ================================================================
 
 struct TrafficResult {
@@ -950,7 +950,7 @@ TrafficResult simTraffic(const GS& gsS, const GS& gsD,
 
     res.hops = (int)path.size() - 1;
 
-    // ── Path quality: product of per-hop ISL utilities ─────────
+    // -- Path quality: product of per-hop ISL utilities ---------
     double pathQ  = 1.0;
     double pathKm = 0.0;
 
@@ -979,7 +979,7 @@ TrafficResult simTraffic(const GS& gsS, const GS& gsD,
         pathQ *= U;
     }
 
-    // ── Distances: add uplink + downlink ──────────────────────
+    // -- Distances: add uplink + downlink ----------------------
     auto vnCtr = [&](const VID& vid) -> Vec3 {
         for (auto& vn : vns) if (vn.vid == vid) return vn.ctr;
         return {};
@@ -988,14 +988,14 @@ TrafficResult simTraffic(const GS& gsS, const GS& gsD,
     double downlinkKm = gsD.pos.dist(vnCtr(gsD.nearVID));
     double totalKm    = pathKm + uplinkKm + downlinkKm;
 
-    // ── E2E delay (ms) ─────────────────────────────────────────
+    // -- E2E delay (ms) -----------------------------------------
     double propMs = totalKm / C::c_light * 1000.0;
     res.e2eDelay_ms = propMs + res.hops * C::queue_ms;
 
-    // ── Packet loss rate (%) ───────────────────────────────────
+    // -- Packet loss rate (%) -----------------------------------
     res.pktLoss_pct = (1.0 - pathQ) * 100.0;
 
-    // ── Throughput (Mbps) ──────────────────────────────────────
+    // -- Throughput (Mbps) --------------------------------------
     double effBW = C::bw_link / std::max(1, res.hops);  // bottleneck
     res.throughput_mbps = effBW * pathQ;
 
@@ -1003,7 +1003,7 @@ TrafficResult simTraffic(const GS& gsS, const GS& gsD,
 }
 
 // ================================================================
-//  §10  TOPOLOGY BUILDERS
+//  Sector10  TOPOLOGY BUILDERS
 // ================================================================
 
 std::vector<Satellite> buildIridium() {
@@ -1012,7 +1012,7 @@ std::vector<Satellite> buildIridium() {
     for (int m = 0; m < C::M; m++) {
         double raan = 2.0 * C::PI * m / C::M;
         for (int n = 0; n < C::N; n++) {
-            // Orbital phase offset Δωf = π/(M·N) (polar constellation, eq.23)
+            // Orbital phase offset deltaωf = π/(M·N) (polar constellation, eq.23)
             double phase    = C::PI * m / (C::M * C::N);
             double initAnom = 2.0 * C::PI * n / C::N + phase;
             Satellite s;
@@ -1050,7 +1050,7 @@ std::vector<VLink> buildVLinks(int M, int N) {
             // Intra-plane: wraps around within same plane
             VID nxt = "VID_" + std::to_string(m) + "_" + std::to_string((n+1)%N);
             lks.push_back({cur, nxt, true});
-            // Inter-plane: adjacent planes only, NO seam (m == M-1 → m+1 = 0 is seam)
+            // Inter-plane: adjacent planes only, NO seam (m == M-1 -> m+1 = 0 is seam)
             if (m < M - 1) {
                 VID nxtP = "VID_" + std::to_string(m+1) + "_" + std::to_string(n);
                 lks.push_back({cur, nxtP, false});
@@ -1083,7 +1083,7 @@ void attachGS(std::vector<GS>& gss, const std::vector<VirtualNode>& vns) {
 }
 
 // ================================================================
-//  §11  TOPOLOGY METRICS  (eqs.5-7)
+//  Sector11  TOPOLOGY METRICS  (eqs.5-7)
 // ================================================================
 
 struct TopoMetrics {
@@ -1101,27 +1101,27 @@ struct TopoMetrics {
                   << "fn=" << fn << " fl=" << fl
                   << " Q(" << t << ")=" << Q
                   << " O(" << t << ")=" << O
-                  << " ΔO(" << t << ")=" << dO << "\n";
+                  << " deltaO(" << t << ")=" << dO << "\n";
     }
 };
 
 // ================================================================
-//  §12  MAIN
+//  Sector12  MAIN
 // ================================================================
 
 int main() {
     std::cout <<
-        "═══════════════════════════════════════════════════════════\n"
+        "===========================================================\n"
         "  Dyna-STN: Dynamic Discrete Topology Routing (Complete)  \n"
-        "  Li, Wu, Wang — IEEE/ACM ToN, Vol. 32, No. 5, 2024      \n"
-        "═══════════════════════════════════════════════════════════\n\n";
+        "  Li, Wu, Wang - IEEE/ACM ToN, Vol. 32, No. 5, 2024      \n"
+        "===========================================================\n\n";
 
-    // ── Simulation parameters ─────────────────────────────────
+    // -- Simulation parameters ---------------------------------
     const int    T_SLOTS  = 10;      // number of time slots
     const double DT       = 600.0;   // slot duration, s (10 min)
     const double CUBE_R   = 2200.0;  // service cube radius, km
 
-    // ── Build constellation ───────────────────────────────────
+    // -- Build constellation -----------------------------------
     auto sats   = buildIridium();
     auto vns    = buildVNs(sats);
     auto vlinks = buildVLinks(C::M, C::N);
@@ -1131,8 +1131,8 @@ int main() {
     ISL::Lv_ref = Lv_km();
     double Lh   = Lh_km(0.0);
 
-    // ── Print header info ─────────────────────────────────────
-    std::cout << "Constellation : " << C::M << " planes × " << C::N
+    // -- Print header info -------------------------------------
+    std::cout << "Constellation : " << C::M << " planes x " << C::N
               << " sats/plane = " << C::M*C::N << " satellites\n"
               << "Virtual nodes : " << vns.size()
               << "  Virtual links: " << vlinks.size() << "\n"
@@ -1140,13 +1140,13 @@ int main() {
               << ISL::Lv_ref << " km\n"
               << "Lh(inter,eq)  = " << Lh << " km\n"
               << "T_comm(max)   = " << std::setprecision(1)
-              << maxCommTime_s() << " s  (eq.11, θ_min=10°)\n"
+              << maxCommTime_s() << " s  (eq.11, theta_min=10deg)\n"
               << "U_SNR(Lv)     = " << std::setprecision(4)
               << ISL::uSNR(ISL::Lv_ref) << "  (calibrated, eq.22)\n"
               << "U_SNR(Lh)     = " << ISL::uSNR(Lh) << "\n"
               << "Service cube R= " << std::setprecision(0) << CUBE_R << " km\n\n";
 
-    // ── Initialise subsystems ────────────────────────────────
+    // -- Initialise subsystems --------------------------------
     DDTMPlane   ddtm;
     OSPFSim     ospf;
     TopoMetrics topo;
@@ -1158,50 +1158,50 @@ int main() {
         {"HongKong", "NewYork"},    // ~12 947 km
     };
 
-    // ── Accumulated stats ─────────────────────────────────────
+    // -- Accumulated stats -------------------------------------
     int    totalMigrations  = 0;
     double totalTm          = 0.0;
     double totalDowntime    = 0.0;
 
-    // ═════════════════════════════════════════════════════════
+    // =========================================================
     //  Main simulation loop
-    // ═════════════════════════════════════════════════════════
+    // =========================================================
     for (int t = 1; t <= T_SLOTS; t++) {
         double now = t * DT;   // absolute time, s
 
-        std::cout << "\n┌─ Slot t=" << t
+        std::cout << "\n|- Slot t=" << t
                   << "  (t=" << std::fixed << std::setprecision(0)
-                  << now << " s) ─────────────────────────────────\n";
+                  << now << " s) ---------------------------------\n";
 
-        // ── 1. Propagate satellites (Keplerian, correct inclination) ─
+        // -- 1. Propagate satellites (Keplerian, correct inclination) -
         for (auto& s : sats) s.update(now);
 
-        // ── 2. Algorithm 1: SID/VID Binding Procedure ────────────
+        // -- 2. Algorithm 1: SID/VID Binding Procedure ------------
         ddtm.runSlot(t, now, vns, sats, vlinks, CUBE_R);
         topo.update(ddtm.fn_sum, ddtm.fl_sum);
 
         int activeVN = 0;
         for (auto& vn : vns) if (vn.active) activeVN++;
 
-        std::cout << "│ [DDTM] ";  topo.print(t);
-        std::cout << "│         Active VNs: " << activeVN
+        std::cout << "| [DDTM] ";  topo.print(t);
+        std::cout << "|         Active VNs: " << activeVN
                   << "/" << vns.size() << "\n";
 
-        // ── 3. Service migrations ─────────────────────────────────
+        // -- 3. Service migrations ---------------------------------
         if (!ddtm.migrations.empty()) {
             totalMigrations += (int)ddtm.migrations.size();
             for (auto& m : ddtm.migrations) {
                 totalTm       += m.Tm;
                 totalDowntime += m.downtime;
             }
-            std::cout << "│ [Migration] count=" << ddtm.migrations.size()
+            std::cout << "| [Migration] count=" << ddtm.migrations.size()
                       << "  avg Tm=" << std::setprecision(4)
                       << ddtm.avgTm() << " s"
                       << "  (tcp+tdp+tl)\n";
             // Show details for first migration
             if (!ddtm.migrations.empty()) {
                 auto& m = ddtm.migrations[0];
-                std::cout << "│   " << m.from << " → " << m.to
+                std::cout << "|   " << m.from << " -> " << m.to
                           << " (" << m.vid << ")"
                           << " tcp=" << std::setprecision(3) << m.tcp
                           << " tdp=" << m.tdp
@@ -1212,7 +1212,7 @@ int main() {
 
         // Algorithm 1 message log (first 4 messages)
         if (!ddtm.msgLog.empty()) {
-            std::cout << "│ [Alg1 msgs] ";
+            std::cout << "| [Alg1 msgs] ";
             int shown = 0;
             for (auto& msg : ddtm.msgLog) {
                 if (shown++ >= 4) { std::cout << "..."; break; }
@@ -1221,7 +1221,7 @@ int main() {
             std::cout << "\n";
         }
 
-        // ── 4. OSPF routing update (Section III-B) ────────────────
+        // -- 4. OSPF routing update (Section III-B) ----------------
         OSPFStats ospfSt = ospf.runEpoch(vns, vlinks, sats, now);
 
         // Push computed RIBs into virtual node router states
@@ -1235,17 +1235,17 @@ int main() {
             }
         }
 
-        std::cout << "│ [OSPF] routeCalc=" << std::fixed
+        std::cout << "| [OSPF] routeCalc=" << std::fixed
                   << std::setprecision(2) << ospfSt.routeCalc_ms
                   << " ms  converge=" << ospfSt.converge_ms
                   << " ms  LSA=" << ospfSt.lsaPkts
                   << " Hello=" << ospfSt.helloPkts
-                  << " ΔLinks=" << ospfSt.changedLinks << "\n";
+                  << " deltaLinks=" << ospfSt.changedLinks << "\n";
 
-        // ── 5. Ground station attachment ──────────────────────────
+        // -- 5. Ground station attachment --------------------------
         attachGS(gss, vns);
 
-        // ── 6. Sample ISL quality for one intra + one inter link ──
+        // -- 6. Sample ISL quality for one intra + one inter link --
         {
             bool doneIntra = false, doneInter = false;
             for (auto& lk : vlinks) {
@@ -1271,9 +1271,9 @@ int main() {
                 double Ul = ISL::uDur(lk.intra, sA->pos, sB->pos);
                 double Ut = ISL::uTotal(L, lk.intra, sA->pos, sB->pos);
 
-                std::cout << "│ [ISL-"
+                std::cout << "| [ISL-"
                           << (lk.intra ? "INTRA" : "INTER") << "] "
-                          << lk.u << "↔" << lk.v
+                          << lk.u << "<->" << lk.v
                           << " L=" << std::setprecision(0) << L
                           << " km  U_SNR=" << std::setprecision(4) << Us
                           << " U_dur=" << Ul
@@ -1284,14 +1284,14 @@ int main() {
             }
         }
 
-        // ── 7. Traffic simulation (Section IV-B) ─────────────────
-        std::cout << "│ [Traffic]\n";
-        std::cout << "│   " << std::left << std::setw(22) << "Flow"
+        // -- 7. Traffic simulation (Section IV-B) -----------------
+        std::cout << "| [Traffic]\n";
+        std::cout << "|   " << std::left << std::setw(22) << "Flow"
                   << std::setw(12) << "Thput(Mbps)"
                   << std::setw(10) << "PLR(%)"
                   << std::setw(12) << "E2E(ms)"
                   << "Hops\n";
-        std::cout << "│   " << std::string(58, '-') << "\n";
+        std::cout << "|   " << std::string(58, '-') << "\n";
 
         for (auto& [src, dst] : SD) {
             GS* gsS = nullptr, *gsD = nullptr;
@@ -1302,8 +1302,8 @@ int main() {
             if (!gsS || !gsD) continue;
 
             TrafficResult tr = simTraffic(*gsS, *gsD, ospf, vns, sats, vlinks);
-            std::cout << "│   " << std::left << std::setw(22)
-                      << (src + "→" + dst)
+            std::cout << "|   " << std::left << std::setw(22)
+                      << (src + "->" + dst)
                       << std::setw(12) << std::fixed
                       << std::setprecision(1) << tr.throughput_mbps
                       << std::setw(10) << std::setprecision(2)
@@ -1313,23 +1313,23 @@ int main() {
                       << tr.hops << "\n";
         }
 
-        // ── 8. Sample bindings (first 6 VNs) ─────────────────────
-        std::cout << "│ [Bindings] ";
+        // -- 8. Sample bindings (first 6 VNs) ---------------------
+        std::cout << "| [Bindings] ";
         int shown = 0;
         for (auto& vn : vns) {
             if (shown++ >= 6) { std::cout << "..."; break; }
             std::cout << vn.vid << ":"
                       << (vn.active ? vn.bound : "none") << " ";
         }
-        std::cout << "\n└────────────────────────────────────────────────\n";
+        std::cout << "\n-------------------------------------------------\n";
     }
 
-    // ═════════════════════════════════════════════════════════
+    // =========================================================
     //  Final statistics
-    // ═════════════════════════════════════════════════════════
-    std::cout << "\n╔═══════════════════════════════════════════════╗\n"
-              << "║              FINAL STATISTICS                  ║\n"
-              << "╚═══════════════════════════════════════════════╝\n";
+    // =========================================================
+    std::cout << "\n=================================================\n"
+              << "=              FINAL STATISTICS                  =\n"
+              << "=================================================\n";
 
     int finalActive = 0;
     for (auto& vn : vns) if (vn.active) finalActive++;
@@ -1338,7 +1338,7 @@ int main() {
               << finalActive << "/" << vns.size() << "\n"
               << "Q(last slot) = " << topo.Q
               << "  [fn=" << topo.fn << " fl=" << topo.fl << "]\n"
-              << "ΔO(last slot) = " << std::fixed << std::setprecision(1)
+              << "deltaO(last slot) = " << std::fixed << std::setprecision(1)
               << topo.dO << "\n"
               << "Total migrations: " << totalMigrations << "\n";
 
@@ -1354,10 +1354,10 @@ int main() {
               << " packets\n";
 
     // Print final ground-station attachments
-    std::cout << "\n[Ground Station → VID attachments at t_last]\n";
+    std::cout << "\n[Ground Station -> VID attachments at t_last]\n";
     for (auto& gs : gss)
         std::cout << "  " << std::left << std::setw(10) << gs.id
-                  << " → " << gs.nearVID
+                  << " -> " << gs.nearVID
                   << " (dist=" << std::fixed << std::setprecision(0)
                   << gs.nearDist << " km)\n";
 
