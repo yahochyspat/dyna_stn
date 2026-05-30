@@ -630,7 +630,8 @@ public:
             std::cout<<"  t="<<std::fixed<<std::setprecision(3)<<e.time
                      <<"  "<<msgStr(e.type)
                      <<"  "<<e.from<<"->"<<e.to
-                     <<"  old="<<e.oldSID<<"  new="<<e.newSID
+                     <<"  old="<<(e.oldSID.empty() ? "none" : e.oldSID)
+                     <<"  new="<<(e.newSID.empty() ? "none" : e.newSID)
                      <<"  "<<a1Str(e.status);
             if(!e.note.empty()) std::cout<<"  "<<e.note;
             std::cout<<"\n";
