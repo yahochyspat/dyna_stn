@@ -1239,7 +1239,7 @@ int main() {
     for(int t=1;t<=T_SLOTS;t++){
         double now=t*DT;
         std::cout<<"\n|- Slot t="<<t<<"  (t="<<std::fixed<<std::setprecision(0)
-                 <<now<<" s) ------------------------------------\n";
+                 <<now<<" s) ----------------------------------------------\n";
 
         for(auto& s:sats) s.update(now);
 
@@ -1309,7 +1309,7 @@ int main() {
         std::cout<<"| [Bindings] ";
         int sh=0; for(auto& vn:vns){if(sh++>=5){std::cout<<"...";break;}
             std::cout<<vn.vid<<":"<<(vn.bound.empty()?"none":vn.bound)<<" ";}
-        std::cout<<"\n-------------------------------------------------\n";
+        std::cout<<"\n----------------------------------------------------------------------\n";
     }
 
     std::cout << "\n=== Final summary ===\n";
